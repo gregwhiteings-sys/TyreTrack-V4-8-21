@@ -1,47 +1,180 @@
-name: Build TyreTrack Windows
-on:
-  workflow_dispatch:
+from datetime import datetime
+from pathlib import Path
+import hashlib
+import shutil
+import subprocess
+import sys
 
-jobs:
-  windows-portable:
-    runs-on: windows-2022
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          architecture: 'x64'
-      - name: Install CPU-only PyTorch
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
-      - name: Install pinned application and build dependencies
-        run: python -m pip install -r requirements-build.txt
-      - name: Validate imports, DLLs, GUI, and model
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: python smoke_test.py
-      - name: Build portable Windows executable
-        run: python -m PyInstaller --noconfirm --clean TyreTrack.spec
-      - name: Copy model alongside executable
-        shell: pwsh
-        run: Copy-Item tyre_detector.pt dist/TyreTrack/tyre_detector.pt
-      - name: Check bundled executable starts without DLL crash
-        shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          $exe = (Resolve-Path 'dist/TyreTrack/TyreTrack.exe').Path
-          $p = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 15
-          if ($p.HasExited) { throw "Packaged application exited unexpectedly with code $($p.ExitCode)" }
-          Stop-Process -Id $p.Id -Force
-          Write-Host 'PASS: packaged GUI remained running for 15 seconds'
-      - uses: actions/upload-artifact@v4
-        with:
-          name: TyreTrack-Windows-Portable
-          path: dist/TyreTrack/
-          if-no-files-found: error
-          retention-days: 14
+root = Path(__file__).resolve().parent
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+required = (
+    "tyretrack.py",
+    "count_line.py",
+    "yard_photo.py",
+    "tyre_detector.pt",
+    "passenger_truck.pt",
+)
+missing = [name for name in required if not (root / name).is_file()]
+if missing:
+    raise SystemExit("STOP: Missing files: " + ", ".join(missing))
+
+source = (root / "tyretrack.py").read_text(encoding="utf-8-sig")
+features = {
+    "optional OAK recording":
+        "self.record_oak_checkbox = QCheckBox(",
+    "15-minute no-count alert":
+        "def _oak_no_count_alert_tick():",
+    "live OAK frame hook":
+        "_oak_frame_received()",
+    "email scheduler alert hook":
+        "_oak_no_count_alert_tick()",
+    "Best Hour tab":
+        'best_hour_tab=tab_page("Best Hour")',
+    "Best Hour calculation":
+        "def refresh_best_hour(self):",
+}
+missing_features = [
+    name for name, marker in features.items() if marker not in source
+]
+if missing_features:
+    raise SystemExit(
+        "STOP: tyretrack.py is missing: "
+        + ", ".join(missing_features)
+        + ". Add the missing feature before rebuilding."
+    )
+
+try:
+    import depthai as dai
+except ImportError as exc:
+    raise SystemExit(
+        f"STOP: DepthAI is missing from {sys.executable}"
+    ) from exc
+
+print("Build Python:", sys.executable, flush=True)
+print("DepthAI version:", dai.__version__, flush=True)
+if not str(dai.__version__).startswith("2.") or not hasattr(
+    dai.node, "XLinkOut"
+):
+    raise SystemExit(
+        "STOP: This app needs DepthAI 2.x with dai.node.XLinkOut."
+    )
+
+subprocess.run(
+    [
+        sys.executable, "-m", "py_compile",
+        "tyretrack.py", "count_line.py", "yard_photo.py",
+    ],
+    cwd=root,
+    check=True,
+)
+
+# Confirm the files load as the tasks the current app expects.
+from ultralytics import YOLO
+
+detector = YOLO(str(root / "tyre_detector.pt"))
+classifier = YOLO(str(root / "passenger_truck.pt"))
+print("Detector task:", detector.task, flush=True)
+print("Classifier task:", classifier.task, flush=True)
+if detector.task != "detect" or classifier.task != "classify":
+    raise SystemExit(
+        "STOP: Expected tyre_detector.pt to be a detection model "
+        "and passenger_truck.pt to be a classification model."
+    )
+
+stage = root / "build" / f"TyreTrack_stage_{stamp}"
+stage.mkdir(parents=True, exist_ok=False)
+stage_dist = stage / "dist"
+
+print("Building in staging:", stage, flush=True)
+subprocess.run(
+    [
+        sys.executable, "-m", "PyInstaller",
+        "--noconfirm", "--clean", "--onedir", "--windowed",
+        "--name", "TyreTrack",
+        "--distpath", str(stage_dist),
+        "--workpath", str(stage / "work"),
+        "--specpath", str(stage / "spec"),
+        "--hidden-import", "yard_photo",
+        "--collect-all", "torchvision",
+        "--collect-all", "depthai",
+        "--add-data", f"{root / 'tyre_detector.pt'};.",
+        "--add-data", f"{root / 'passenger_truck.pt'};.",
+        str(root / "tyretrack.py"),
+    ],
+    cwd=root,
+    check=True,
+)
+
+bundle = stage_dist / "TyreTrack"
+exe = bundle / "TyreTrack.exe"
+internal = bundle / "_internal"
+qt_bin = internal / "PyQt5" / "Qt5" / "bin"
+
+if not exe.is_file():
+    raise SystemExit("STOP: Staged EXE is missing.")
+
+# Apply the same duplicate-DLL workaround as your working build.
+dll_names = (
+    "MSVCP140.dll",
+    "VCRUNTIME140.dll",
+    "VCRUNTIME140_1.dll",
+)
+for name in dll_names:
+    if not (internal / name).is_file() or not (qt_bin / name).is_file():
+        raise SystemExit(
+            f"STOP: Expected DLL layout missing for {name}. "
+            "Previous bundle has not been moved."
+        )
+
+dll_backup = stage / "qt_duplicate_dll_backup"
+dll_backup.mkdir()
+for name in dll_names:
+    shutil.move(str(qt_bin / name), str(dll_backup / name))
+    print("Removed duplicate PyQt5 DLL:", name, flush=True)
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+for filename in ("tyre_detector.pt", "passenger_truck.pt"):
+    copies = list(bundle.rglob(filename))
+    if len(copies) != 1 or digest(root / filename) != digest(copies[0]):
+        raise SystemExit(
+            f"STOP: {filename} is missing, duplicated, or differs "
+            "from the build-folder file. Previous bundle is untouched."
+        )
+    print("Verified bundled weights:", filename, flush=True)
+
+private_files = list(bundle.rglob("email_config.ini"))
+if private_files:
+    raise SystemExit(
+        "STOP: email_config.ini found inside staged bundle. "
+        "Do not distribute it."
+    )
+
+destination = root / "dist" / "TyreTrack"
+backup = None
+destination.parent.mkdir(exist_ok=True)
+
+# Only move the previous bundle after every staged check has passed.
+try:
+    if destination.exists():
+        backup = root / f"TyreTrack_backup_{stamp}"
+        shutil.move(str(destination), str(backup))
+    shutil.move(str(bundle), str(destination))
+except Exception:
+    if backup is not None and not destination.exists():
+        shutil.move(str(backup), str(destination))
+    raise
+
+print()
+print("Build ready:", destination / "TyreTrack.exe")
+print("Previous bundle:", backup or "None")
+print("DLL backups:", dll_backup)
+print("Bundled weights match the build-folder .pt files.")
+print("No email_config.ini was found in the distributed folder.")
+print("Distribute the whole dist\\TyreTrack folder, not just the EXE.")
