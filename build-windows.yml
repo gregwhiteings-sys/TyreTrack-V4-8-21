@@ -23,6 +23,8 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python smoke_test.py
+      - name: Verify YOLO tracking and SciPy imports
+        run: python tracking_smoke_test.py
       - name: Build portable Windows executable
         run: python -m PyInstaller --noconfirm --clean TyreTrack.spec
       - name: Copy model alongside executable

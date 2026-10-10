@@ -3,21 +3,20 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 root = Path(SPECPATH)
-datas = []
-binaries = []
-hiddenimports = []
-for package in ('ultralytics', 'torch', 'torchvision', 'depthai'):
+datas, binaries, hiddenimports = [], [], []
+for package in ('ultralytics', 'torch', 'torchvision', 'depthai', 'scipy'):
     d, b, h = collect_all(package)
     datas += d
     binaries += b
     hiddenimports += h
+# scipy's compiled private helpers may be imported dynamically by tracking.
+hiddenimports += collect_submodules('scipy._lib')
+hiddenimports += ['scipy._cyutility', 'scipy._lib._ccallback_c']
+hiddenimports = sorted(set(hiddenimports))
 
-# Keep model outside the exe for easy model updates.
 a = Analysis(
     [str(root / 'TyreTrack_V4_8_2_overlay_options.py')],
-    pathex=[str(root)],
-    binaries=binaries,
-    datas=datas,
+    pathex=[str(root)], binaries=binaries, datas=datas,
     hiddenimports=hiddenimports,
     excludes=['tensorflow', 'jax', 'cupy', 'torch._dynamo.backends.cudagraphs'],
     noarchive=False,
